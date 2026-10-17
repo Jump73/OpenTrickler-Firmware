@@ -1,5 +1,6 @@
 #include "rest_ai_tuning.h"
 #include "ai_tuning.h"
+#include "pid_autotune.h"
 #include "profile.h"
 #include "http_rest.h"
 #include "common.h"
@@ -296,6 +297,13 @@ bool http_rest_ai_tuning_start(struct fs_file *file, int num_params,
         }
     }
 
+    if (pid_autotune_is_active()) {
+        int len = snprintf(ai_tuning_json_buffer, sizeof(ai_tuning_json_buffer),
+            "%s{\"success\":false,\"error\":\"PID Tuning is running - exit it first\"}",
+            http_json_header);
+        return finalize_json_response(file, len);
+    }
+
     if (profile_idx < 0 || profile_idx >= MAX_PROFILE_CNT) {
         int len = snprintf(ai_tuning_json_buffer, sizeof(ai_tuning_json_buffer),
             "%s{\"success\":false,\"error\":\"Invalid profile_idx (must be 0-%d)\"}",
@@ -303,7 +311,7 @@ bool http_rest_ai_tuning_start(struct fs_file *file, int num_params,
         return finalize_json_response(file, len);
     }
 
-    if (target_weight <= 0.0f) {
+    if (!(target_weight > 0.0f) || !isfinite(target_weight)) {
         target_weight = 30.0f;
     }
 
@@ -364,6 +372,13 @@ bool http_rest_ai_machine_calibration_start(struct fs_file *file, int num_params
         }
     }
 
+    if (pid_autotune_is_active()) {
+        int len = snprintf(ai_tuning_json_buffer, sizeof(ai_tuning_json_buffer),
+            "%s{\"success\":false,\"error\":\"PID Tuning is running - exit it first\"}",
+            http_json_header);
+        return finalize_json_response(file, len);
+    }
+
     if (profile_idx < 0 || profile_idx >= MAX_PROFILE_CNT) {
         int len = snprintf(ai_tuning_json_buffer, sizeof(ai_tuning_json_buffer),
             "%s{\"success\":false,\"error\":\"Invalid profile_idx (must be 0-%d)\"}",
@@ -371,7 +386,7 @@ bool http_rest_ai_machine_calibration_start(struct fs_file *file, int num_params
         return finalize_json_response(file, len);
     }
 
-    if (target_weight <= 0.0f) {
+    if (!(target_weight > 0.0f) || !isfinite(target_weight)) {
         target_weight = 40.0f;
     }
 
@@ -823,6 +838,16 @@ bool http_rest_ai_tuning_config_get(struct fs_file *file, int num_params,
 
 bool http_rest_ai_tuning_config_set(struct fs_file *file, int num_params,
                                     char *params[], char *values[]) {
+    // Sample counts and budgets are read live by the running session (stage
+    // limits, sample plans), so changing them mid-run would reshape a
+    // characterization half way through.
+    if (ai_tuning_is_active()) {
+        int len = snprintf(ai_tuning_json_buffer, sizeof(ai_tuning_json_buffer),
+            "%s{\"success\":false,\"error\":\"AI tuning is running - wait for it to finish or cancel it first\"}",
+            http_json_header);
+        return finalize_json_response(file, len);
+    }
+
     ai_tuning_config_t* cfg = ai_tuning_get_config();
 
     for (int idx = 0; idx < num_params; idx++) {

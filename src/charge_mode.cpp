@@ -22,6 +22,8 @@
 #include "common.h"
 #include "servo_gate.h"
 #include "ai_tuning.h"
+#include "pid_autotune.h"
+#include "learn_from_throws.h"
 
 
 uint8_t charge_weight_digits[] = {0, 0, 0, 0, 0};
@@ -117,6 +119,18 @@ static float ml_fine_time_ms = 0.0f;
 // Deferred AI tuning recording (same pattern - defer to cup removal for settled scale reading)
 static bool ai_record_pending = false;
 static ai_drop_telemetry_t ai_pending_telemetry;
+
+// Learn from throws: what the PID loop saw on this charge, folded into the
+// profile's learner once the settled weight is known (charge_mode_stabilize(),
+// before any top-up adds powder that is not part of the charge's own tail).
+static bool ltl_record_pending = false;
+static throw_observation_t ltl_pending_obs;
+static uint8_t ltl_pending_profile_idx = 0;
+static float ltl_pending_coarse_stop = 0.0f;
+static float ltl_pending_fine_stop = 0.0f;
+// How long after the coarse stop the "what coarse left" reading is taken:
+// long enough for the coarse tail and the scale lag to have landed.
+#define LTL_AFTER_COARSE_MS 1500u
 
 // Menu system
 extern AppState_t exit_state;
@@ -1175,6 +1189,7 @@ void charge_mode_wait_for_complete() {
     last_final_weight_gn = 0.0f;
     ai_record_pending = false;
     ml_record_pending = false;
+    ltl_record_pending = false;
     charge_mode_reset_live_metrics();
     charge_mode_set_live_phase("dispense", charge_mode_config.target_charge_weight, 0.0f);
     charge_mode_config.charge_mode_event &= ~(CHARGE_MODE_EVENT_UNDER_CHARGE | CHARGE_MODE_EVENT_OVER_CHARGE);
@@ -1800,23 +1815,25 @@ void charge_mode_wait_for_complete() {
         }
         else {
             ok = run_motor_for_duration(SELECT_COARSE_TRICKLER_MOTOR, plan_speed_rps, plan_on_time_ms);
-            if (ok) {
-                float stop_weight = capture_coarse_stop_measurement(320, start_weight);
-                mark_coarse_stop(stop_weight, true);
-            }
         }
 
         if (!ok) {
             return;
         }
 
+        // run_motor_for_duration() has already stopped the motor, so take the
+        // end tick here, before any scale wait or the coarse reverse in
+        // mark_coarse_stop(), or those would be counted as motor on-time.
         TickType_t motor_end_tick = xTaskGetTickCount();
+
+        // Raw reading, not capture_coarse_stop_measurement(): that only accepts
+        // weights above 3% of the charge target, and characterization pulses
+        // are deliberately far smaller than that (e.g. under 1.3 gr for a
+        // 43.5 gr target), so it returned NaN and ai_tuning_record_drop()
+        // rejected every drop, leaving charge mode on "Remove Cup".
         float stop_weight = get_latest_measurement(250, start_weight);
         if (sample_motor_mode == AI_MOTOR_MODE_COARSE_ONLY) {
-            stop_weight = capture_coarse_stop_measurement(320, stop_weight);
-            if (!coarse_stop_weight_valid) {
-                mark_coarse_stop(stop_weight, true);
-            }
+            mark_coarse_stop(stop_weight, true);
         }
 
         memset(&pending_ai_drop, 0, sizeof(pending_ai_drop));
@@ -3406,6 +3423,22 @@ void charge_mode_wait_for_complete() {
         bool should_coarse_trickler_move = true;
         int scale_fail_count = 0;
 
+        // Stop thresholds: the global ones, or this profile's learned ones
+        // when Learn From Throws is on for it.
+        float pid_coarse_stop = charge_mode_config.eeprom_charge_mode_data.coarse_stop_threshold;
+        float pid_fine_stop = charge_mode_config.eeprom_charge_mode_data.fine_stop_threshold;
+        const bool ltl_learning = learn_from_throws_thresholds(selected_profile_idx,
+                                                               &pid_coarse_stop,
+                                                               &pid_fine_stop);
+        throw_observation_t ltl_obs;
+        memset(&ltl_obs, 0, sizeof(ltl_obs));
+        ltl_obs.target_gn = charge_mode_config.target_charge_weight;
+        ltl_obs.coarse_stop_reading_gn = NAN;
+        ltl_obs.after_coarse_reading_gn = NAN;
+        ltl_obs.fine_stop_reading_gn = NAN;
+        ltl_obs.final_reading_gn = NAN;
+        TickType_t ltl_coarse_stop_tick = 0;
+
         // For the manual finish check below. Fetched once per charge rather
         // than per loop iteration - kernel weight does not change mid-charge.
         float manual_finish_kernel_gn = 0.0f;
@@ -3465,16 +3498,33 @@ void charge_mode_wait_for_complete() {
                 }
             }
 
-            if (error <= charge_mode_config.eeprom_charge_mode_data.fine_stop_threshold) {
+            if (ltl_coarse_stop_tick != 0 && !isfinite(ltl_obs.after_coarse_reading_gn) &&
+                (uint32_t)((current_sample_tick - ltl_coarse_stop_tick) * portTICK_PERIOD_MS) >= LTL_AFTER_COARSE_MS) {
+                ltl_obs.after_coarse_reading_gn = current_weight;
+            }
+
+            if (error <= pid_fine_stop) {
                 stop_all_motors();
                 perform_fine_reverse();
+                if (ltl_learning) {
+                    ltl_obs.fine_stop_reading_gn = current_weight;
+                    ltl_pending_obs = ltl_obs;
+                    ltl_pending_profile_idx = selected_profile_idx;
+                    ltl_pending_coarse_stop = pid_coarse_stop;
+                    ltl_pending_fine_stop = pid_fine_stop;
+                    ltl_record_pending = true;
+                }
                 break;
             }
 
             if (should_coarse_trickler_move &&
-                error < charge_mode_config.eeprom_charge_mode_data.coarse_stop_threshold) {
+                error < pid_coarse_stop) {
                 should_coarse_trickler_move = false;
                 mark_coarse_stop(current_weight, true);
+                if (ltl_obs.coarse_ran) {
+                    ltl_obs.coarse_stop_reading_gn = current_weight;
+                    ltl_coarse_stop_tick = current_sample_tick;
+                }
             }
 
             float elapsed_ms = (float)((current_sample_tick - last_sample_tick) * portTICK_PERIOD_MS);
@@ -3492,6 +3542,7 @@ void charge_mode_wait_for_complete() {
                 float coarse_speed = fmaxf(coarse_trickler_min_speed,
                                            fminf(coarse_pid, coarse_trickler_max_speed));
                 charge_mode_command_motor(SELECT_COARSE_TRICKLER_MOTOR, coarse_speed);
+                ltl_obs.coarse_ran = true;
             }
             else {
                 charge_mode_command_motor(SELECT_COARSE_TRICKLER_MOTOR, 0);
@@ -3499,7 +3550,7 @@ void charge_mode_wait_for_complete() {
 
             bool use_pulse = charge_mode_config.eeprom_charge_mode_data.pulse_mode_enabled &&
                              error < charge_mode_config.eeprom_charge_mode_data.pulse_threshold &&
-                             error > charge_mode_config.eeprom_charge_mode_data.fine_stop_threshold;
+                             error > pid_fine_stop;
 
             if (use_pulse) {
                 float pulse_speed = fmaxf(fine_trickler_min_speed, fine_trickler_max_speed * 0.3f);
@@ -3619,6 +3670,20 @@ void charge_mode_stabilize() {
 
     if (last_final_weight_valid) {
         charge_mode_update_true_final_measurement(last_final_weight_gn);
+    }
+
+    // Learn From Throws: fold this charge in with the settled weight from
+    // before any top-up below -- top-up powder is not the charge's tail.
+    if (ltl_record_pending) {
+        ltl_record_pending = false;
+        if (last_final_weight_valid) {
+            ltl_pending_obs.final_reading_gn = last_final_weight_gn;
+            learn_from_throws_record(ltl_pending_profile_idx,
+                                     &ltl_pending_obs,
+                                     charge_mode_acceptance_tolerance(),
+                                     ltl_pending_coarse_stop,
+                                     ltl_pending_fine_stop);
+        }
     }
 
     if (last_final_weight_valid && !last_charge_was_ai_tuning) {
@@ -4043,6 +4108,21 @@ bool charge_mode_data_load_for_profile(uint8_t profile_idx) {
 }
 
 
+bool charge_mode_get_profile_thresholds(uint8_t profile_idx, float *coarse_stop_gn,
+                                        float *fine_stop_gn, float *accept_tolerance_gn) {
+    if (profile_idx >= MAX_PROFILE_CNT) {
+        return false;
+    }
+    const eeprom_charge_mode_data_t *data = (profile_idx == charge_mode_config.loaded_profile_idx)
+        ? &charge_mode_config.eeprom_charge_mode_data
+        : &charge_mode_profile_data.profiles[profile_idx];
+    if (coarse_stop_gn != NULL) *coarse_stop_gn = data->coarse_stop_threshold;
+    if (fine_stop_gn != NULL) *fine_stop_gn = data->fine_stop_threshold;
+    if (accept_tolerance_gn != NULL) *accept_tolerance_gn = data->accept_tolerance_gn;
+    return true;
+}
+
+
 uint8_t charge_mode_data_get_loaded_profile_idx(void) {
     return charge_mode_config.loaded_profile_idx;
 }
@@ -4400,6 +4480,12 @@ bool http_rest_charge_mode_state(struct fs_file *file, int num_params, char *par
                     (void)xQueueSend(encoder_event_queue, &button_event, pdMS_TO_TICKS(250));
                 }
                 charge_mode_config.charge_mode_state = CHARGE_MODE_EXIT;
+            }
+            // PID Tuning owns the motors and the menu while it runs (or sits on
+            // its result screen); the OVERRIDE_FROM_REST below would only be
+            // swallowed by it and leave charge_mode_state claiming a charge.
+            else if (new_state == CHARGE_MODE_WAIT_FOR_ZERO && pid_autotune_is_active()) {
+                // ignored
             }
             // Enter
             else if (new_state == CHARGE_MODE_WAIT_FOR_ZERO) {
