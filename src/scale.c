@@ -340,9 +340,10 @@ bool http_rest_scale_config(struct fs_file *file, int num_params, char *params[]
 bool http_rest_scale_action(struct fs_file *file, int num_params, char *params[], char *values[]) {
     // Mappings:
     // a0 (scale_action_t): Command to the scale
-    
+
     // Control
     scale_action_t action = SCALE_ACTION_NO_ACTION;
+    bool accepted = false;
 
     for (int idx = 0; idx < num_params; idx += 1) {
         if (strcmp(params[idx], "a0") == 0) {
@@ -350,9 +351,13 @@ bool http_rest_scale_action(struct fs_file *file, int num_params, char *params[]
             
             switch (action) {
                 case SCALE_ACTION_FORCE_ZERO:
-                    if (scale_config.scale_handle->force_zero != NULL) {
+                    if (scale_config.scale_handle && scale_config.scale_handle->force_zero) {
                         scale_config.scale_handle->force_zero();
+                        accepted = true;
                     }
+                    break;
+                case SCALE_ACTION_GET_TARE_STATUS:
+                    accepted = true;
                     break;
                 default: 
                     break;
@@ -360,15 +365,23 @@ bool http_rest_scale_action(struct fs_file *file, int num_params, char *params[]
         }
     }
 
-    static char json_buffer[64];
+    int tare_status = SCALE_TARE_UNVERIFIED;
+    if (scale_config.scale_handle && scale_config.scale_handle->get_tare_status) {
+        tare_status = scale_config.scale_handle->get_tare_status();
+    }
 
-    // Response
+    static char json_buffer[128];
+
+    // 'accepted' only means the driver received the request. A verified G&G
+    // result becomes available asynchronously through a0=2 / tare_status.
     snprintf(json_buffer, 
              sizeof(json_buffer),
              "%s"
-             "{\"a0\":%d}",
+             "{\"a0\":%d,\"accepted\":%s,\"tare_status\":%d}",
              http_json_header,
-             (int) action);
+             (int) action,
+             accepted ? "true" : "false",
+             tare_status);
 
     size_t data_length = strlen(json_buffer);
     file->data = json_buffer;

@@ -490,6 +490,25 @@ static bool charge_mode_force_zero_and_wait_for_ai(void) {
     charge_mode_set_result_colour(charge_mode_config.eeprom_charge_mode_data.neopixel_not_ready_colour);
 
     scale_config.scale_handle->force_zero();
+
+    // G&G completes the UART tare asynchronously and verifies real zero
+    // readings. Wait for that result rather than racing its 500 ms quiet gap
+    // and incorrectly timing out after 2.5 seconds.
+    if (scale_config.scale_handle->get_tare_status != NULL) {
+        TickType_t started = xTaskGetTickCount();
+        while ((xTaskGetTickCount() - started) < pdMS_TO_TICKS(9000)) {
+            if (button_wait_for_input(false) == BUTTON_RST_PRESSED) {
+                charge_mode_config.charge_mode_state = CHARGE_MODE_EXIT;
+                return false;
+            }
+            int status = scale_config.scale_handle->get_tare_status();
+            if (status == SCALE_TARE_SUCCESS) return true;
+            if (status == SCALE_TARE_FAILED) return false;
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        return false;
+    }
+
     vTaskDelay(pdMS_TO_TICKS(350));
 
     FloatRingBuffer tare_buffer(5);
@@ -3781,6 +3800,9 @@ void charge_mode_wait_for_cup_removal() {
                 snprintf(title_string, sizeof(title_string), "AI Tare Timeout");
                 charge_mode_set_live_phase("ai_tare_timeout", 0.0f, 0.0f);
                 vTaskDelay(pdMS_TO_TICKS(250));
+                ai_tuning_cancel();
+                charge_mode_config.charge_mode_state = CHARGE_MODE_EXIT;
+                return;
             }
             charge_mode_config.charge_mode_state = CHARGE_MODE_WAIT_FOR_COMPLETE;
             return;
