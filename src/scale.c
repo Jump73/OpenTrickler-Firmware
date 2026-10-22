@@ -208,7 +208,12 @@ bool scale_init() {
     set_scale_driver(scale_config.persistent_config.scale_driver);
 
     // Create the Task for the listener loop
-    xTaskCreate(scale_config.scale_handle->read_loop_task, "Scale Task", configMINIMAL_STACK_SIZE, NULL, 9, NULL);
+    // The G&G UART reader parses weights with strtof; give it extra stack
+    // headroom when remote tare is serialized in the same task.
+    configSTACK_DEPTH_TYPE scale_stack_size =
+        (scale_config.persistent_config.scale_driver == SCALE_DRIVER_GNG_JJB)
+        ? (configMINIMAL_STACK_SIZE * 2) : configMINIMAL_STACK_SIZE;
+    xTaskCreate(scale_config.scale_handle->read_loop_task, "Scale Task", scale_stack_size, NULL, 9, NULL);
 
     // Register to eeprom save all
     eeprom_register_handler(scale_config_save);

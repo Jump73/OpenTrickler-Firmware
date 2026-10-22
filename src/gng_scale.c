@@ -6,6 +6,7 @@
 #include <math.h>
 #include <task.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "hardware/uart.h"
 #include "configuration.h"
@@ -18,6 +19,11 @@ const static char CMD_CALIBRATE_FUNC[] = "!q\r\n";
 const static char CMD_CHANGE_WEIGHT_UNIT[] = "!s\r\n";
 const static char CMD_TARE_FUNC[] = "!t\r\n";
 const static char CMD_BACKLIGHT[] = "!u\r\n";
+
+// The G&G scale can ignore !t when it arrives during a !p data request.
+// Queue tare so the reader task owns the whole UART transaction.
+static volatile bool gng_tare_requested = false;
+static volatile bool gng_tare_in_progress = false;
 
 
 
@@ -76,6 +82,30 @@ void _gng_scale_listener_task(void *p) {
     gngscale_standard_data_format_t frame;
 
     while (true) {
+        bool perform_tare = false;
+        taskENTER_CRITICAL();
+        if (gng_tare_requested && !gng_tare_in_progress) {
+            gng_tare_requested = false;
+            gng_tare_in_progress = true;
+            perform_tare = true;
+        }
+        taskEXIT_CRITICAL();
+
+        if (perform_tare) {
+            // The previous !p response has completed (or timed out). Leave
+            // the balance idle before !t, then avoid !p while tare settles.
+            vTaskDelay(pdMS_TO_TICKS(100));
+            while (uart_is_readable(SCALE_UART)) {
+                uart_getc(SCALE_UART);
+            }
+            scale_write(CMD_TARE_FUNC, strlen(CMD_TARE_FUNC));
+            uart_tx_wait_blocking(SCALE_UART);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            taskENTER_CRITICAL();
+            gng_tare_in_progress = false;
+            taskEXIT_CRITICAL();
+        }
+
         // Reset frame buffer index at the start of each poll cycle (fixes partial-frame carryover on timeout)
         string_buf_idx = 0;
 
@@ -147,7 +177,12 @@ void scalegng_press_print_key() {
 //ESC t -> 0x1B 0x74 0x0D 0x0A standard setting
 // ! t -> 0x21 0x74 0x0D 0x0A
 void scalegng_press_tare_key() {
-    scale_write(CMD_TARE_FUNC, strlen(CMD_TARE_FUNC));
+    // Coalesce repeated requests, including multiple WWW button clicks.
+    taskENTER_CRITICAL();
+    if (!gng_tare_in_progress) {
+        gng_tare_requested = true;
+    }
+    taskEXIT_CRITICAL();
 }
 
 //ESC s -> 0x1B 0x73 0x0D 0x0A standard setting
