@@ -2268,7 +2268,7 @@ html[data-ot-theme="dark"], html[data-ot-theme="dark"] {
 <dialog id="scaleZeroedSuccessDialog" class="modal">
     <div class="modal-box">
         <h3 class="font-bold text-lg">Info</h3>
-        <p class="py-4">Scale Zero Successful</p>
+        <p class="py-4" id="scaleZeroSuccessText">Scale Zero Successful</p>
     </div>
     <form method="dialog" class="modal-backdrop">
         <button>close</button>
@@ -2278,7 +2278,7 @@ html[data-ot-theme="dark"], html[data-ot-theme="dark"] {
 <dialog id="scaleZeroedFailDialog" class="modal">
     <div class="modal-box">
         <h3 class="font-bold text-lg">Error</h3>
-        <p class="py-4">Failed to Zero Scale</p>
+        <p class="py-4" id="scaleZeroFailText">Failed to Zero Scale</p>
     </div>
     <form method="dialog" class="modal-backdrop">
         <button>close</button>
@@ -2774,32 +2774,61 @@ const ChargeModeState = Object.freeze({
         })
     }
 
-    // Send scale force zero command
-    function scaleForceZero() {
-        const uri = `/rest/scale_action?a0=${encodeURIComponent(ScaleAction.FORCE_ZERO)}`;
+    // G&G taring is asynchronous: the REST response acknowledges the request,
+    // not the physical zero. Poll until the balance readings verify the tare.
+    let scaleTareRequestInFlight = false;
+    async function scaleForceZero() {
+        if (scaleTareRequestInFlight) return;
+        scaleTareRequestInFlight = true;
+        const buttons = document.querySelectorAll('[onclick="scaleForceZero()"]');
+        buttons.forEach(button => button.disabled = true);
 
-        // Call the scale action URI
-        fetch(uri)
-        .then(response => {
-            return response.json();
-        })
-        .then(data => {
-            // console.log(data);
+        const showResult = (successful, message) => {
+            const textId = successful ? 'scaleZeroSuccessText' : 'scaleZeroFailText';
+            const dialogId = successful ? 'scaleZeroedSuccessDialog' : 'scaleZeroedFailDialog';
+            document.getElementById(textId).textContent = message;
+            document.getElementById(dialogId).showModal();
+        };
 
-            var scale_action_response = data["a0"];
-
-            if (scale_action_response == ScaleAction.FORCE_ZERO) {
-                const dialogModal = document.getElementById("scaleZeroedSuccessDialog");
-                dialogModal.showModal();
+        try {
+            const response = await fetch(`/rest/scale_action?a0=${ScaleAction.FORCE_ZERO}`);
+            if (!response.ok) throw new Error('Scale action request failed');
+            const data = await response.json();
+            if (!data.accepted) {
+                showResult(false, 'This scale driver does not support remote tare.');
+                return;
             }
-            else {
-                const dialogModal = document.getElementById("scaleZeroedFailDialog");
-                dialogModal.showModal();
+
+            // Other drivers have no feedback: do not display a false success.
+            if (data.tare_status === -1) {
+                showResult(true, 'Tare command sent (not verified by the scale).');
+                return;
+            }
+
+            const deadline = Date.now() + 9000;
+            while (Date.now() < deadline) {
+                if (data.tare_status === 3) {
+                    showResult(true, 'Scale Zero Successful — verified by stable readings.');
+                    return;
+                }
+                if (data.tare_status === 4) {
+                    showResult(false, 'The scale did not reach zero after two tare attempts.');
+                    return;
+                }
+                await new Promise(resolve => setTimeout(resolve, 250));
+                const statusResponse = await fetch('/rest/scale_action?a0=2');
+                if (!statusResponse.ok) throw new Error('Scale status request failed');
+                const statusData = await statusResponse.json();
+                data.tare_status = statusData.tare_status;
+            }
+            showResult(false, 'Timed out waiting for scale tare verification.');
+        } catch (error) {
+            console.error('Error applying scale tare', error);
+            showResult(false, 'Cannot verify tare: communication with OpenTrickler failed.');
+        } finally {
+            scaleTareRequestInFlight = false;
+            buttons.forEach(button => button.disabled = false);
         }
-        })
-        .catch(error => {
-            console.error("Error applying force zero");
-        });
     }
 
     function servoGateSetState(state) {
