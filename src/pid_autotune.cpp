@@ -248,7 +248,10 @@ static bool auto_zero(void) {
         }
 
         if (last_tick >= next_send && steady) {
-            if ((tries % 2) == 0) {
+            // G&G uses !t, not the generic "T" command. Never bypass its
+            // serialized UART/tare verification with a raw write.
+            if (scale_config.persistent_config.scale_driver == SCALE_DRIVER_GNG_JJB ||
+                (tries % 2) == 0) {
                 if (scale_config.scale_handle->force_zero != NULL) {
                     scale_config.scale_handle->force_zero();
                 }

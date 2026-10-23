@@ -5,19 +5,32 @@
 #include <time.h>
 #include <math.h>
 #include <task.h>
-#include <stdlib.h>
+#include <string.h>
 
 #include "hardware/uart.h"
 #include "configuration.h"
 #include "scale.h"
 #include "app.h"
 
-const static char CMD_REQUEST_DATA_TRANSFER[] = "!p\r\n";
-const static char CMD_CALIBRATE_FUNC[] = "!q\r\n";
+static const char CMD_REQUEST_DATA_TRANSFER[] = "!p\r\n";
+static const char CMD_CALIBRATE_FUNC[] = "!q\r\n";
 // const static char CMD_COUNTING_FUNC[] = "!r\r\n";
-const static char CMD_CHANGE_WEIGHT_UNIT[] = "!s\r\n";
-const static char CMD_TARE_FUNC[] = "!t\r\n";
-const static char CMD_BACKLIGHT[] = "!u\r\n";
+static const char CMD_CHANGE_WEIGHT_UNIT[] = "!s\r\n";
+static const char CMD_TARE_FUNC[] = "!t\r\n";
+static const char CMD_BACKLIGHT[] = "!u\r\n";
+
+// G&G can beep on a remote TARE without actually zeroing. The listener owns
+// both polling and taring so a new !p cannot interrupt the tare operation.
+#define GNG_TARE_QUIET_BEFORE_MS        100
+#define GNG_TARE_QUIET_AFTER_MS         500
+#define GNG_TARE_VERIFY_TIMEOUT_MS    2500
+#define GNG_TARE_POLL_GAP_MS            50
+#define GNG_TARE_ZERO_TOLERANCE       0.05f
+#define GNG_TARE_ZERO_SAMPLES             3
+#define GNG_TARE_MAX_ATTEMPTS             2
+
+static volatile scale_tare_status_t gng_tare_status = SCALE_TARE_IDLE;
+static volatile bool gng_listener_ready = false;
 
 
 
@@ -36,6 +49,7 @@ typedef union {
 void _gng_scale_listener_task(void *p);
 void scalegng_press_print_key();
 void scalegng_press_tare_key();
+int scalegng_get_tare_status(void);
 
 extern scale_config_t scale_config;
 
@@ -43,6 +57,7 @@ extern scale_config_t scale_config;
 scale_handle_t gng_scale_handle = {
     .read_loop_task = _gng_scale_listener_task,
     .force_zero = scalegng_press_tare_key,
+    .get_tare_status = scalegng_get_tare_status,
 };
 
 static float _decode_measurement_msg(gngscale_standard_data_format_t * msg) {
@@ -57,11 +72,14 @@ static float _decode_measurement_msg(gngscale_standard_data_format_t * msg) {
 
     // Decode weight information
     char *endptr;
-    float weight = strtof(msg->data, &endptr);
+    char numeric_data[sizeof(msg->data) + 1];
+    memcpy(numeric_data, msg->data, sizeof(msg->data));
+    numeric_data[sizeof(msg->data)] = '\0';
+    float weight = strtof(numeric_data, &endptr);
 
-    if( endptr == msg->data ) {
+    if (endptr == numeric_data) {
         // Conversion failed
-        return nanf(msg->data);
+        return NAN;
     }
 
     // Apply the sign
@@ -70,65 +88,124 @@ static float _decode_measurement_msg(gngscale_standard_data_format_t * msg) {
     return weight;
 }
 
-//read UART
-void _gng_scale_listener_task(void *p) {
+// Called only by the G&G listener task. Each poll is a complete UART
+// transaction: no other G&G command is started until it ends or times out.
+static bool _gng_poll_once(float *measurement) {
     uint8_t string_buf_idx = 0;
     gngscale_standard_data_format_t frame;
 
-    while (true) {
-        // Reset frame buffer index at the start of each poll cycle (fixes partial-frame carryover on timeout)
-        string_buf_idx = 0;
+    // Remove any late bytes from a previous, timed-out response.
+    while (uart_is_readable(SCALE_UART)) {
+        uart_getc(SCALE_UART);
+    }
 
-        // Clear any stale data in RX buffer before sending request
+    scale_write(CMD_REQUEST_DATA_TRANSFER, strlen(CMD_REQUEST_DATA_TRANSFER));
+
+    TickType_t start_tick = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - start_tick) < pdMS_TO_TICKS(200)) {
+        while (uart_is_readable(SCALE_UART)) {
+            char ch = uart_getc(SCALE_UART);
+            frame.bytes[string_buf_idx++] = ch;
+
+            if (string_buf_idx == sizeof(frame)) {
+                string_buf_idx = 0;
+                // Reject malformed/partial frames; they must not confirm tare.
+                if (frame.terminator[0] == '\r' && frame.terminator[1] == '\n') {
+                    float weight = _decode_measurement_msg(&frame);
+                    if (isfinite(weight)) {
+                        scale_config.current_scale_measurement = weight;
+                        if (scale_config.scale_measurement_ready) {
+                            xSemaphoreGive(scale_config.scale_measurement_ready);
+                        }
+                        if (measurement) {
+                            *measurement = weight;
+                        }
+                        return true;
+                    }
+                }
+            }
+
+            if (ch == '\n') {
+                string_buf_idx = 0;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    return false;
+}
+
+static void _gng_set_tare_status(scale_tare_status_t status) {
+    taskENTER_CRITICAL();
+    gng_tare_status = status;
+    taskEXIT_CRITICAL();
+}
+
+int scalegng_get_tare_status(void) {
+    taskENTER_CRITICAL();
+    scale_tare_status_t status = gng_tare_status;
+    taskEXIT_CRITICAL();
+    return (int)status;
+}
+
+// Only the listener may change PENDING to RUNNING. Requests arriving while a
+// tare is in progress are coalesced, rather than sending overlapping !t's.
+static bool _gng_claim_tare_request(void) {
+    taskENTER_CRITICAL();
+    bool requested = (gng_tare_status == SCALE_TARE_PENDING);
+    if (requested) {
+        gng_tare_status = SCALE_TARE_RUNNING;
+    }
+    taskEXIT_CRITICAL();
+    return requested;
+}
+
+static void _gng_perform_tare(void) {
+    for (unsigned attempt = 0; attempt < GNG_TARE_MAX_ATTEMPTS; ++attempt) {
+        // The preceding !p transaction is finished. Give the balance a quiet
+        // gap before !t, and do not issue any !p while it processes the key.
+        vTaskDelay(pdMS_TO_TICKS(GNG_TARE_QUIET_BEFORE_MS));
         while (uart_is_readable(SCALE_UART)) {
             uart_getc(SCALE_UART);
         }
+        scale_write(CMD_TARE_FUNC, strlen(CMD_TARE_FUNC));
+        uart_tx_wait_blocking(SCALE_UART);
+        vTaskDelay(pdMS_TO_TICKS(GNG_TARE_QUIET_AFTER_MS));
 
-        // Request for a data transfer using mutex-protected write
-        scale_write(CMD_REQUEST_DATA_TRANSFER, strlen(CMD_REQUEST_DATA_TRANSFER));
-
-        // Wait for scale to respond (up to 200ms)
+        unsigned zero_readings = 0;
         TickType_t start_tick = xTaskGetTickCount();
-        bool got_response = false;
-
-        while ((xTaskGetTickCount() - start_tick) < pdMS_TO_TICKS(200)) {
-            while (uart_is_readable(SCALE_UART)) {
-                char ch = uart_getc(SCALE_UART);
-                frame.bytes[string_buf_idx++] = ch;
-
-                // If we have received 14 bytes then we can decode the message
-                if (string_buf_idx == sizeof(gngscale_standard_data_format_t)) {
-                    // Data is ready, send to decode
-                    scale_config.current_scale_measurement = _decode_measurement_msg(&frame);
-                    // Signal the data is ready
-                    if (scale_config.scale_measurement_ready) {
-                        xSemaphoreGive(scale_config.scale_measurement_ready);
-                    }
-
-                    // Reset
-                    string_buf_idx = 0;
-                    got_response = true;
+        while ((xTaskGetTickCount() - start_tick) < pdMS_TO_TICKS(GNG_TARE_VERIFY_TIMEOUT_MS)) {
+            float weight = NAN;
+            if (_gng_poll_once(&weight) && fabsf(weight) <= GNG_TARE_ZERO_TOLERANCE) {
+                if (++zero_readings >= GNG_TARE_ZERO_SAMPLES) {
+                    _gng_set_tare_status(SCALE_TARE_SUCCESS);
+                    return;
                 }
-
-                // \n is the terminator. Reset on receiving it.
-                if (ch == '\n') {
-                    string_buf_idx = 0;
-                    if (got_response) {
-                        break;
-                    }
-                }
+            } else {
+                zero_readings = 0;
             }
-
-            if (got_response) {
-                break;
-            }
-
-            // Small delay before checking again
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(GNG_TARE_POLL_GAP_MS));
         }
+    }
 
-        // Wait before next request
-        vTaskDelay(pdMS_TO_TICKS(50));
+    _gng_set_tare_status(SCALE_TARE_FAILED);
+}
+
+// Read UART and handle queued tare requests in one task, avoiding the race
+// between the WWW/encoder task sending !t and this task polling with !p.
+void _gng_scale_listener_task(void *p) {
+    (void)p;
+    taskENTER_CRITICAL();
+    gng_listener_ready = true;
+    taskEXIT_CRITICAL();
+
+    while (true) {
+        if (_gng_claim_tare_request()) {
+            _gng_perform_tare();
+        } else {
+            _gng_poll_once(NULL);
+        }
+        vTaskDelay(pdMS_TO_TICKS(GNG_TARE_POLL_GAP_MS));
     }
 }
 
@@ -147,7 +224,14 @@ void scalegng_press_print_key() {
 //ESC t -> 0x1B 0x74 0x0D 0x0A standard setting
 // ! t -> 0x21 0x74 0x0D 0x0A
 void scalegng_press_tare_key() {
-    scale_write(CMD_TARE_FUNC, strlen(CMD_TARE_FUNC));
+    taskENTER_CRITICAL();
+    if (!gng_listener_ready) {
+        gng_tare_status = SCALE_TARE_FAILED;
+    } else if (gng_tare_status != SCALE_TARE_PENDING &&
+               gng_tare_status != SCALE_TARE_RUNNING) {
+        gng_tare_status = SCALE_TARE_PENDING;
+    }
+    taskEXIT_CRITICAL();
 }
 
 //ESC s -> 0x1B 0x73 0x0D 0x0A standard setting

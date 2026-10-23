@@ -16,6 +16,9 @@ typedef struct {
     // Basic functions
     void (*read_loop_task)(void *self);
     void (*force_zero)(void);
+    // Optional asynchronous verification for scale-specific tare operations.
+    // NULL means the driver cannot report whether the scale actually zeroed.
+    int (*get_tare_status)(void);
 } scale_handle_t;
 
 
@@ -49,7 +52,17 @@ typedef enum {
 typedef enum {
     SCALE_ACTION_NO_ACTION = 0,
     SCALE_ACTION_FORCE_ZERO = 1,
+    SCALE_ACTION_GET_TARE_STATUS = 2,
 } scale_action_t;
+
+typedef enum {
+    SCALE_TARE_UNVERIFIED = -1,
+    SCALE_TARE_IDLE = 0,
+    SCALE_TARE_PENDING = 1,
+    SCALE_TARE_RUNNING = 2,
+    SCALE_TARE_SUCCESS = 3,
+    SCALE_TARE_FAILED = 4,
+} scale_tare_status_t;
 
 
 typedef struct {
